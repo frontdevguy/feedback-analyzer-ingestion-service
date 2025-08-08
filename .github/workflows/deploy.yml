@@ -1,0 +1,270 @@
+name: Deploy Lambda Function
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  FUNCTION_NAME: unc-ingester-lambda
+  API_NAME: unc-ingester-api
+  QUEUE_NAME: unc-consumer-queue.fifo
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install and package dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -t ./package/
+          cp ingester_function.py ./package/
+          cp config.py ./package/
+          cp logger_setup.py ./package/
+          cp -r handlers/ ./package/
+
+      - name: Create deployment zip
+        run: |
+          cd package
+          zip -r ../lambda-deployment.zip .
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create or verify IAM role and permissions
+        run: |
+          ROLE_NAME="ingester-lambda-execution-role"
+
+          # Create role if it doesn't exist
+          if ! aws iam get-role --role-name $ROLE_NAME > /dev/null 2>&1; then
+            echo "Creating $ROLE_NAME..."
+            
+            # Create the role with trust policy for Lambda
+            aws iam create-role \
+              --role-name $ROLE_NAME \
+              --assume-role-policy-document '{
+                "Version": "2012-10-17",
+                "Statement": [{
+                  "Effect": "Allow",
+                  "Principal": {
+                    "Service": "lambda.amazonaws.com"
+                  },
+                  "Action": "sts:AssumeRole"
+                }]
+              }'
+          else
+            echo "Role $ROLE_NAME already exists"
+          fi
+
+          # Ensure basic Lambda execution policy is attached
+          BASIC_POLICY_ARN="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+          if ! aws iam list-attached-role-policies --role-name $ROLE_NAME | grep -q "$BASIC_POLICY_ARN"; then
+            echo "Attaching Lambda basic execution policy..."
+            aws iam attach-role-policy \
+              --role-name $ROLE_NAME \
+              --policy-arn $BASIC_POLICY_ARN
+          else
+            echo "Lambda basic execution policy already attached"
+          fi
+
+          # Update or create custom permissions policy
+          echo "Ensuring custom permissions are up to date..."
+          aws iam put-role-policy \
+            --role-name $ROLE_NAME \
+            --policy-name CustomPermissions \
+            --policy-document '{
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "secretsmanager:GetSecretValue"
+                  ],
+                  "Resource": "arn:aws:secretsmanager:*:*:secret:*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "execute-api:Invoke",
+                    "execute-api:ManageConnections"
+                  ],
+                  "Resource": "arn:aws:execute-api:*:*:*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "sqs:SendMessage",
+                    "sqs:GetQueueUrl"
+                  ],
+                  "Resource": "arn:aws:sqs:*:*:unc-consumer-queue.fifo"
+                }
+              ]
+            }'
+
+          echo "Waiting for role/policy changes to propagate..."
+          sleep 10
+
+      - name: Deploy or create Lambda function
+        run: |
+          if aws lambda get-function --function-name ${{ env.FUNCTION_NAME }} > /dev/null 2>&1; then
+          echo "Updating existing Lambda function code..."
+          aws lambda update-function-code \
+              --function-name ${{ env.FUNCTION_NAME }} \
+              --zip-file fileb://lambda-deployment.zip
+
+          echo "Waiting for code update to complete..."
+          aws lambda wait function-updated --function-name ${{ env.FUNCTION_NAME }}
+          else
+          echo "Creating new Lambda function..."
+          aws lambda create-function \
+              --function-name ${{ env.FUNCTION_NAME }} \
+              --runtime python3.11 \
+              --role arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/ingester-lambda-execution-role \
+              --handler ingester_function.ingester_handler \
+              --zip-file fileb://lambda-deployment.zip \
+              --timeout 30 \
+              --memory-size 128 \
+              --description "Unc Ingester Lambda Function deployed via GitHub Actions"
+
+          echo "Waiting for function creation to complete..."
+          aws lambda wait function-exists --function-name ${{ env.FUNCTION_NAME }}
+          aws lambda wait function-updated --function-name ${{ env.FUNCTION_NAME }}
+          fi
+
+      - name: Set up scheduled warmer for unc-ingester-lambda
+        run: |
+          FUNCTION_NAME=${{ env.FUNCTION_NAME }}
+          REGION=${{ env.AWS_REGION }}
+          ACCOUNT_ID=${{ secrets.AWS_ACCOUNT_ID }}
+          RULE_NAME="warm-up-${FUNCTION_NAME}"
+          SCHEDULE="rate(5 minutes)"
+          STATEMENT_ID="warmup-${FUNCTION_NAME}-permission"
+
+          # Create CloudWatch rule
+          aws events put-rule \
+            --name "$RULE_NAME" \
+            --schedule-expression "$SCHEDULE"
+
+          # Add invoke permission if not already set
+          if ! aws lambda get-policy --function-name $FUNCTION_NAME | grep -q "$STATEMENT_ID"; then
+            aws lambda add-permission \
+              --function-name $FUNCTION_NAME \
+              --statement-id $STATEMENT_ID \
+              --action lambda:InvokeFunction \
+              --principal events.amazonaws.com \
+              --source-arn arn:aws:events:$REGION:$ACCOUNT_ID:rule/$RULE_NAME
+          else
+            echo "Permission $STATEMENT_ID already exists."
+          fi
+
+          # Add Lambda as target
+          aws events put-targets \
+            --rule "$RULE_NAME" \
+            --targets "Id"="1","Arn"="arn:aws:lambda:$REGION:$ACCOUNT_ID:function:$FUNCTION_NAME"
+
+      - name: Update Lambda configuration
+        run: |
+          echo "Updating Lambda configuration..."
+          aws lambda update-function-configuration \
+          --function-name ${{ env.FUNCTION_NAME }} \
+          --runtime python3.11 \
+          --timeout 30 \
+          --memory-size 128
+
+          echo "Waiting for configuration update to complete..."
+          aws lambda wait function-updated --function-name ${{ env.FUNCTION_NAME }}
+
+      - name: Wait for Lambda update
+        run: aws lambda wait function-updated --function-name ${{ env.FUNCTION_NAME }}
+
+      - name: Set up or update API Gateway
+        run: |
+          API_ID=$(aws apigateway get-rest-apis \
+            --query "items[?name=='${{ env.API_NAME }}'].id" \
+            --output text)
+
+          if [ -z "$API_ID" ] || [ "$API_ID" = "None" ]; then
+            API_ID=$(aws apigateway create-rest-api \
+              --name ${{ env.API_NAME }} \
+              --description "API Gateway for Unc Ingester Lambda" \
+              --query 'id' --output text)
+          fi
+
+          ROOT_RESOURCE_ID=$(aws apigateway get-resources \
+            --rest-api-id $API_ID \
+            --query 'items[?path==`/`].id' --output text)
+
+          PROXY_RESOURCE_ID=$(aws apigateway get-resources \
+            --rest-api-id $API_ID \
+            --query 'items[?pathPart==`{proxy+}`].id' --output text)
+
+          if [ -z "$PROXY_RESOURCE_ID" ] || [ "$PROXY_RESOURCE_ID" = "None" ]; then
+            PROXY_RESOURCE_ID=$(aws apigateway create-resource \
+              --rest-api-id $API_ID \
+              --parent-id $ROOT_RESOURCE_ID \
+              --path-part '{proxy+}' \
+              --query 'id' --output text)
+          fi
+
+          aws apigateway put-method \
+            --rest-api-id $API_ID \
+            --resource-id $PROXY_RESOURCE_ID \
+            --http-method ANY \
+            --authorization-type NONE || true
+
+          LAMBDA_ARN=$(aws lambda get-function \
+            --function-name ${{ env.FUNCTION_NAME }} \
+            --query 'Configuration.FunctionArn' --output text)
+
+          aws apigateway put-integration \
+            --rest-api-id $API_ID \
+            --resource-id $PROXY_RESOURCE_ID \
+            --http-method ANY \
+            --type AWS_PROXY \
+            --integration-http-method POST \
+            --uri "arn:aws:apigateway:${{ env.AWS_REGION }}:lambda:path/2015-03-31/functions/$LAMBDA_ARN/invocations" || true
+
+          aws apigateway put-method \
+            --rest-api-id $API_ID \
+            --resource-id $ROOT_RESOURCE_ID \
+            --http-method ANY \
+            --authorization-type NONE || true
+
+          aws apigateway put-integration \
+            --rest-api-id $API_ID \
+            --resource-id $ROOT_RESOURCE_ID \
+            --http-method ANY \
+            --type AWS_PROXY \
+            --integration-http-method POST \
+            --uri "arn:aws:apigateway:${{ env.AWS_REGION }}:lambda:path/2015-03-31/functions/$LAMBDA_ARN/invocations" || true
+
+          aws lambda add-permission \
+            --function-name ${{ env.FUNCTION_NAME }} \
+            --statement-id apigateway-invoke \
+            --action lambda:InvokeFunction \
+            --principal apigateway.amazonaws.com \
+            --source-arn "arn:aws:execute-api:${{ env.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:$API_ID/*/*" || true
+
+          aws apigateway create-deployment \
+            --rest-api-id $API_ID \
+            --stage-name prod \
+            --description "Production deployment"
+
+          echo "Deployment Complete!"
+          echo "Your webhook endpoint: https://$API_ID.execute-api.${{ env.AWS_REGION }}.amazonaws.com/prod/webhooks"
+          echo "API Gateway URL: https://$API_ID.execute-api.${{ env.AWS_REGION }}.amazonaws.com/prod"
