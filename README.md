@@ -1,4 +1,4 @@
-# TheUnc Ingester Service
+# The Ingestion Service
 
 Minimal AWS Lambda behind API Gateway that enqueues POST /webhooks bodies to an SQS FIFO queue. Structured JSON logging, Secrets Manager, CI/CD via GitHub Actions.
 
